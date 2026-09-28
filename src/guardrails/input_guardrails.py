@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,58 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Zero-width / bidi / soft-hyphen characters attackers use to split keywords
+_INVISIBLE_CHARS = (
+    "\u00ad\u180e\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c"
+    "\u202d\u202e\u2060\u2061\u2062\u2063\u2064\ufeff"
+)
+
+INJECTION_PATTERNS = [
+    # Instruction override (EN)
+    r"\b(ignore|disregard|forget|override|bypass)\s+(all\s+|any\s+|the\s+|your\s+)*"
+    r"(previous|prior|above|earlier|preceding|system|safety|security)?\s*"
+    r"(instructions?|rules?|prompts?|directives?|guidelines?|polic(y|ies))",
+    # Persona switch / jailbreak roles
+    r"\byou\s+are\s+now\b",
+    r"\bpretend\s+(you\s+are|to\s+be)\b",
+    r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|evil|uncensored)",
+    r"\b(DAN|developer\s+mode|jailbreak)\b",
+    # System prompt / hidden config extraction
+    r"\bsystem\s+prompt\b",
+    r"\b(reveal|show|print|repeat|dump|output|leak)\s+(me\s+)?(your|the)\s+"
+    r"(hidden\s+|internal\s+|initial\s+|original\s+)?(instructions?|prompt|config(uration)?|rules)",
+    r"\btranslate\s+(your|the)\s+(instructions?|prompt|rules)",
+    # Direct credential extraction (a customer never needs these)
+    r"\b(admin|root|system|internal|database|db)\s+(password|credentials?)",
+    r"\bapi[\s_-]*keys?\b",
+    r"\b(database|db)\s+(host|server|connection|string)",
+    r"\bconnection\s+string\b",
+    r"\bfill\s+in\s+(the\s+)?blanks?\b",
+    # Vietnamese variants (after accent stripping)
+    r"\bbo\s+qua\s+(moi\s+|tat\s+ca\s+)?(huong\s+dan|chi\s+dan|quy\s+tac)",
+    r"\bquen\s+(moi\s+|tat\s+ca\s+)?(huong\s+dan|chi\s+dan|quy\s+tac)",
+    r"\b(tiet\s+lo|cho\s+(toi\s+)?xem)\s+.*(mat\s+khau|system\s+prompt|api|cau\s+hinh)",
+    r"\bmat\s+khau\s+(admin|quan\s+tri|he\s+thong)",
+]
+
+
+def normalize_text(text: str) -> str:
+    """Canonicalize before matching: NFKC, drop invisible chars, strip accents, collapse spaces.
+
+    NFKC folds full-width / compatibility letters (e.g. ``ｉｇｎｏｒｅ``) into ASCII;
+    removing zero-width chars defeats ``Ignore\u200b all``; accent stripping lets
+    one set of Vietnamese patterns match both ``bỏ qua`` and ``bo qua``.
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = "".join(ch for ch in text if ch not in _INVISIBLE_CHARS)
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFD", text)
+        if unicodedata.category(ch) != "Mn"
+    )
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +104,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
+    normalized = normalize_text(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +132,19 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    normalized = normalize_text(user_input)
+    if not normalized:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # Prefix word-boundary match: "account" hits "accounts", but "kill" skips "skill"
+    def _has(term: str) -> bool:
+        return re.search(r"\b" + re.escape(term), normalized) is not None
 
-    pass  # Replace with your implementation
+    if any(_has(t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(_has(t) for t in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -112,6 +165,7 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.last_reason: str | None = None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -144,14 +198,25 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        self.last_reason = None
 
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "injection"
+            return self._block_response(
+                "Request blocked: this message looks like an attempt to override "
+                "the assistant's rules. I can only help with VinBank banking questions."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "off_topic"
+            return self._block_response(
+                "Sorry, I'm the VinBank assistant and can only help with banking topics "
+                "such as accounts, transfers, savings, loans and credit cards."
+            )
+
+        return None
 
 
 # ============================================================

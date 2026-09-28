@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -37,29 +38,50 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
+    # Order matters: specific secrets first, then generic PII, so a longer match
+    # (e.g. a 12-digit CCCD) is not partially eaten by the phone pattern.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}",
+        "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\s*(?:is|là|[:=])\s*[\"'`]?[^\s\"'`,;]+",
+        "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+        "national_id": r"\b\d{12}\b|\b\d{9}\b",
+        "vn_phone": r"(?<!\d)(?:\+84|84|0)(?:[\s.-]?\d){9,10}(?!\d)",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Known protected values (data/protected/vinbank_secrets.json), even without a label
+    for secret in DEMO_SECRETS:
+        if secret and re.search(re.escape(secret), redacted, re.IGNORECASE):
+            issues.append("protected_secret: 1 found")
+            redacted = re.sub(re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE)
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+def contains_obfuscated_secret(response: str) -> bool:
+    """Catch secrets spelled with separators, e.g. ``a-d-m-i-n-1-2-3`` or ``sk vinbank…``.
+
+    Regex redaction misses these, so compare against the protected values after
+    dropping every non-alphanumeric character.
+    """
+    squashed = re.sub(r"[^a-z0-9]", "", (response or "").lower())
+    for secret in DEMO_SECRETS:
+        needle = re.sub(r"[^a-z0-9]", "", secret.lower())
+        if len(needle) >= 6 and needle in squashed:
+            return True
+    return False
 
 
 # ============================================================
@@ -149,6 +171,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +195,40 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_action = None
 
-        return llm_response  # TODO: modify if needed
+        # Fail closed: an obfuscated protected secret cannot be redacted reliably,
+        # so the whole reply is replaced.
+        if contains_obfuscated_secret(response_text):
+            self.blocked_count += 1
+            self.last_action = "blocked"
+            llm_response.content = self._replace(self.SAFE_MESSAGE)
+            return llm_response
+
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            self.last_action = "redacted"
+            llm_response.content = self._replace(filtered["redacted"])
+            response_text = filtered["redacted"]
+
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = self._replace(self.SAFE_MESSAGE)
+
+        return llm_response
+
+    SAFE_MESSAGE = (
+        "I'm sorry, I can't share that information. "
+        "Is there anything else I can help you with regarding your VinBank account?"
+    )
+
+    @staticmethod
+    def _replace(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================
