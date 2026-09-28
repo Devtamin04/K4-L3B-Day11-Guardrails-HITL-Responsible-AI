@@ -47,7 +47,13 @@ def content_filter(response: str) -> dict:
         "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\s*(?:is|là|[:=])\s*[\"'`]?[^\s\"'`,;]+",
         "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
         "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
-        "national_id": r"\b\d{12}\b|\b\d{9}\b",
+        # Labelled CCCD/CMND, or a bare 12-digit number that is not a VND amount.
+        # A bare 9-digit number is too often money (100000000 VND) to redact blindly.
+        "national_id": (
+            r"\b(?:cccd|cmnd|căn\s*cước|can\s*cuoc|national\s*id|id\s*(?:number|no\.?))"
+            r"[^\d\n]{0,12}\d{9}(?:\d{3})?\b"
+            r"|\b\d{12}\b(?!\s*(?:vnd|vnđ|đồng|dong|đ\b))"
+        ),
         "vn_phone": r"(?<!\d)(?:\+84|84|0)(?:[\s.-]?\d){9,10}(?!\d)",
     }
 
@@ -190,12 +196,11 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_action = None
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
-
-        self.last_action = None
 
         # Fail closed: an obfuscated protected secret cannot be redacted reliably,
         # so the whole reply is replaced.

@@ -16,8 +16,9 @@ from google.genai import types
 class RateLimitPlugin(base_plugin.BasePlugin):
     """Block users who exceed max_requests within window_seconds."""
 
-    def __init__(self, max_requests: int = 10, window_seconds: int = 60):
+    def __init__(self, max_requests: int = 10, window_seconds: int = 60, clock=time.time):
         super().__init__(name="rate_limiter")
+        self.clock = clock  # injectable so a burst can be simulated independent of LLM latency
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.user_windows: dict[str, deque] = defaultdict(deque)
@@ -34,7 +35,7 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         """Return Content to block, or None to allow."""
         self.total_count += 1
         user_id = getattr(invocation_context, "user_id", None) or "anonymous"
-        now = time.time()
+        now = self.clock()
         window = self.user_windows[user_id]
 
         while window and window[0] <= now - self.window_seconds:

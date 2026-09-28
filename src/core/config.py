@@ -276,6 +276,8 @@ ALLOWED_TOPICS = [
     "tai khoan", "giao dich", "tiet kiem", "lai suat",
     "chuyen tien", "the tin dung", "so du", "vay",
     "ngan hang", "atm",
+    "chuyen khoan", "tin dung", "the ghi no", "mo the", "nap tien",
+    "rut tien", "thanh toan", "sao ke", "gui tien", "khoan vay",
 ]
 
 BLOCKED_TOPICS = [

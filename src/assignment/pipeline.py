@@ -293,7 +293,18 @@ async def run_assignment_suite(pipeline) -> dict:
     flood_query = "What is my current account balance?"
     sent = limiter.max_requests + 5
     print(f"\n--- Test 3: rate limit ({sent} requests, same user) ---")
-    flood_rows = [await guarded.process(flood_query, user_id="flood_user") for _ in range(sent)]
+    # A flood arrives as one burst. Requests run sequentially here, so pin the
+    # limiter's clock to the burst start; otherwise slow LLM replies (> window /
+    # max_requests seconds each) would let the window slide and hide the flood.
+    real_clock = limiter.clock
+    burst_start = real_clock()
+    limiter.clock = lambda: burst_start
+    try:
+        flood_rows = [
+            await guarded.process(flood_query, user_id="flood_user") for _ in range(sent)
+        ]
+    finally:
+        limiter.clock = real_clock
     rl_blocked = sum(1 for r in flood_rows if r["layer"] == limiter.name)
     print(f"  passed={sent - rl_blocked} blocked={rl_blocked}")
 

@@ -58,7 +58,11 @@ INJECTION_PATTERNS = [
     r"\byou\s+are\s+now\b",
     r"\bpretend\s+(you\s+are|to\s+be)\b",
     r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|evil|uncensored)",
-    r"\b(DAN|developer\s+mode|jailbreak)\b",
+    # "dan" alone is ordinary Vietnamese after accent stripping (dẫn, dân, đan),
+    # so DAN only counts in a persona context.
+    r"\b(you\s+are|act\s+as|become|be)\s+(a\s+|now\s+)?dan\b",
+    r"\bdan\s+(mode|prompt|jailbreak)\b",
+    r"\b(developer\s+mode|jailbreak(ed)?|do\s+anything\s+now)\b",
     # System prompt / hidden config extraction
     r"\bsystem\s+prompt\b",
     r"\b(reveal|show|print|repeat|dump|output|leak)\s+(me\s+)?(your|the)\s+"
